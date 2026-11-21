@@ -1127,7 +1127,7 @@ def calculate_zones(ranges: list[float], hr: bool, nframe: int) -> None:
 
     if target_ssimu2 is not None and ssimu2 != "":
         p15_floor = target_ssimu2_p15 if target_ssimu2_p15 is not None else (target_ssimu2 - 8.0)
-        projected_avg = metric_average + 1.0
+        projected_avg = metric_average + 1.4
         effective_delta = min(projected_avg - target_ssimu2, metric_percentile_15 - p15_floor)
         crf_shift = max(-6.0, min(6.0, round((effective_delta * 0.85) * 4) / 4))
         orig_crf = crf
