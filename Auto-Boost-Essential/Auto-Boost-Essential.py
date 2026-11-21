@@ -48,11 +48,14 @@ from rich.console import Console
 from statistics import quantiles
 from math import ceil, log10
 from pathlib import Path
+import contextlib
+import ctypes
 import subprocess
 import argparse
 import platform
 import shutil
 import struct
+import urllib.request
 import glob
 import sys
 import gc
@@ -80,6 +83,8 @@ parser.add_argument(
     choices=['auto', 'cpu', 'gpu'],
     help='SSIMU2 mode: auto (default when flag used), cpu (vs-zip), or gpu (Vship)'
 )
+parser.add_argument("--target-ssimu2", type=float, default=None, help="Target final average SSIMULACRA2 score (auto-adjusts base CRF from fast pass)")
+parser.add_argument("--target-ssimu2-p15", type=float, default=None, help="Minimum 15th percentile SSIMULACRA2 floor (default: target-ssimu2 - 8.0)")
 parser.add_argument("--verbose", action='store_true', help = "Enable more verbosity | Default: not active")
 parser.add_argument("-r", "--resume", action='store_true', help = "Resume the process from the last (un)completed stage | Default: not active")
 parser.add_argument("-nb", "--no-boosting", action='store_true', help = "Runs the script without boosting (final encode only) | Default: not active")
@@ -119,6 +124,10 @@ fast_params = args.fast_params if args.fast_params is not None else ""
 final_params = args.final_params if args.final_params is not None else ""
 #grain_format = args.grain_format # upcoming auto-FGS feature
 ssimu2 = args.ssimu2 if args.ssimu2 is not None else ""
+target_ssimu2 = args.target_ssimu2
+target_ssimu2_p15 = args.target_ssimu2_p15
+if target_ssimu2 is not None and ssimu2 == "":
+    ssimu2 = "auto"
 verbose = args.verbose
 resume = args.resume
 no_boosting = args.no_boosting
@@ -215,19 +224,12 @@ else:
         print("The final pass speed must be either slower, slow, medium, fast or faster.")
         raise SystemExit(1)
 
-if "--crf" in fast_params:
-    index = fast_params.index("--crf")
-    try:
-        quality = float(fast_params[index+6:index+11])
-    except:
-        try:
-            quality = float(fast_params[index+6:index+10])
-        except:
-            try:
-                quality = float(fast_params[index+6:index+8])
-            except:
-                print("CRF must have 0, 1 or 2 decimals.")
-                raise SystemExit(1)
+crf_match = re.search(r"(?:^|\s)--crf\s+(\d+(?:\.\d{1,2})?)(?:\s|$)", fast_params)
+if crf_match:
+    quality = float(crf_match.group(1))
+elif "--crf" in fast_params:
+    print("CRF must have 0, 1 or 2 decimals.")
+    raise SystemExit(1)
 else:
     if quality not in ["low", "medium", "high"]:
         print("The quality preset must be either low, medium or high.")
@@ -261,25 +263,58 @@ f"""
 from vstools import vs, core, depth, DitherType
 core.max_cache_size = 1024
 src = core.ffms2.Source(source=r"{src_file}", cachefile=r"{cache_file}")
-bit_to_format = {{
-    8: vs.YUV420P8,
-    10: vs.YUV420P10,
-    12: vs.YUV420P12
-}}
-bit_to_dither = {{
-    8: DitherType.NONE,
-    10: DitherType.NONE,
-    12: DitherType.RANDOM
-}}
-fmt = bit_to_format.get(src.format.bits_per_sample, vs.YUV420P16)
-dt = bit_to_dither.get(src.format.bits_per_sample, DitherType.RANDOM)
-src = depth(src.resize.Bilinear(format=fmt), 10, dither_type=dt)
+if src.format.id != vs.YUV420P10:
+    bit_to_format = {{
+        8: vs.YUV420P8,
+        10: vs.YUV420P10,
+        12: vs.YUV420P12
+    }}
+    bit_to_dither = {{
+        8: DitherType.NONE,
+        10: DitherType.NONE,
+        12: DitherType.RANDOM
+    }}
+    fmt = bit_to_format.get(src.format.bits_per_sample, vs.YUV420P16)
+    dt = bit_to_dither.get(src.format.bits_per_sample, DitherType.RANDOM)
+    src = depth(src.resize.Bilinear(format=fmt), 10, dither_type=dt)
 src.set_output()
 """
         )
 
 core.max_cache_size = 1024
 console = Console()
+
+
+@contextlib.contextmanager
+def _gpu_mutex(name: str = "Local\\RTX5060Ti_GPU_Lock", timeout_ms: int = 600_000):
+    if platform.system() != "Windows":
+        yield
+        return
+    k32 = ctypes.windll.kernel32
+    handle = k32.CreateMutexW(None, False, name)
+    if not handle:
+        yield
+        return
+    acquired = False
+    try:
+        wait_res = k32.WaitForSingleObject(handle, timeout_ms)
+        acquired = wait_res in (0, 0x80)
+        if not acquired:
+            raise TimeoutError(f"Timeout aguardando lock de GPU ({name})")
+        yield
+    finally:
+        if acquired:
+            k32.ReleaseMutex(handle)
+        k32.CloseHandle(handle)
+
+
+def _unload_ocr_vram() -> None:
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8765/api/control/unload-vram", method="POST")
+        with urllib.request.urlopen(req, timeout=2):
+            pass
+    except Exception:
+        pass
 
 def read_from_offset(file_path: Path, offset: int, size: int) -> bytes:
     with open(file_path, 'rb') as file:
@@ -642,6 +677,16 @@ def track_progress(vspipe_resume_value: int, svt_cmd: list[str], enc_pass: str):
     ) as progress:
 
         task = progress.add_task("[yellow]Initializing            " if ssimu2 == "" else "[yellow]Initializing                  ", total=None)
+        svt_proc = None
+        svt_err_log = tmp_dir / f"{src_file.stem}_{enc_pass}_svt.err.log"
+
+        def _print_svt_err_tail() -> None:
+            if svt_err_log.exists():
+                err_lines = [ln for ln in svt_err_log.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+                if err_lines:
+                    console.print("[red]SVT-AV1 error output (last 25 lines):[/red]")
+                    for ln in err_lines[-25:]:
+                        console.print(ln, markup=False)
 
         try:
             vpy_vars = {}
@@ -653,36 +698,38 @@ def track_progress(vspipe_resume_value: int, svt_cmd: list[str], enc_pass: str):
             else:
                 vspipe_resume_value_loc = 0
 
-            svt_proc = subprocess.Popen(
-                svt_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            with open(svt_err_log, "w", encoding="utf-8", errors="replace") as err_fh:
+                svt_proc = subprocess.Popen(
+                    svt_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=err_fh,
+                )
 
-            progress.update(
-                task,
-                description=f"[green]Encoding {enc_pass} pass     {is_fast}" if ssimu2 == "" else f"[green]Encoding {enc_pass} pass           {is_fast}",
-                completed=vspipe_resume_value_loc,
-                total=clip_og.num_frames
-            )
+                progress.update(
+                    task,
+                    description=f"[green]Encoding {enc_pass} pass     {is_fast}" if ssimu2 == "" else f"[green]Encoding {enc_pass} pass           {is_fast}",
+                    completed=vspipe_resume_value_loc,
+                    total=clip_og.num_frames
+                )
 
-            def prog_func(current_frame, total_frames):
-                progress.update(task, completed=vspipe_resume_value_loc+current_frame)
+                def prog_func(current_frame, total_frames):
+                    progress.update(task, completed=vspipe_resume_value_loc+current_frame)
 
-            clip.output(svt_proc.stdin, y4m=True, progress_update=prog_func)
-
-            progress.update(
-                task,
-                description=f"[green]Finalizing {enc_pass} pass   {is_fast}" if ssimu2 == "" else f"[green]Finalizing {enc_pass} pass         {is_fast}",
-                completed=vspipe_resume_value_loc + progress.tasks[task].total - 1
-            )
-
-            svt_proc.communicate()
+                try:
+                    clip.output(svt_proc.stdin, y4m=True, progress_update=prog_func)
+                    progress.update(
+                        task,
+                        description=f"[green]Finalizing {enc_pass} pass   {is_fast}" if ssimu2 == "" else f"[green]Finalizing {enc_pass} pass         {is_fast}",
+                        completed=vspipe_resume_value_loc + progress.tasks[task].total - 1
+                    )
+                finally:
+                    svt_proc.communicate()
 
             if svt_proc.returncode != 0:
                 progress.stop()
                 console.print(f"[red]The {enc_pass} pass encountered an error:[/red] SVT-AV1 exited with code {svt_proc.returncode}")
+                _print_svt_err_tail()
                 raise SystemExit(1)
 
             progress.update(
@@ -694,15 +741,18 @@ def track_progress(vspipe_resume_value: int, svt_cmd: list[str], enc_pass: str):
         except KeyboardInterrupt:
             progress.stop()
             console.print("\n[yellow]Interrupted by user (Ctrl+C). Stopping...[/yellow]")
-            svt_proc.terminate()
+            if svt_proc is not None and svt_proc.poll() is None:
+                svt_proc.terminate()
             raise SystemExit(1)
         except subprocess.CalledProcessError as e:
             progress.stop()
             console.print(f"[red]The {enc_pass} pass encountered an error:[/red]\n{e}")
+            _print_svt_err_tail()
             raise SystemExit(1)
         except Exception as e:
             progress.stop()
             console.print(f"[red]The {enc_pass} pass encountered an error:[/red]\n{e}")
+            _print_svt_err_tail()
             raise SystemExit(1)
 
 def fast_pass() -> None:
@@ -771,6 +821,8 @@ def final_pass() -> None:
         encoder_params += f'--speed {final_speed} '
     if not isinstance(quality, (int, float)):
         encoder_params += f'--quality {quality} '
+    elif "--crf" not in final_params.split():
+        encoder_params += f'--crf {quality:g} '
     if final_params:
         encoder_params += f'{final_params}'
 
@@ -859,6 +911,7 @@ def calculate_metric() -> None:
         cut_encoded_clip = encoded_clip
 
     global ssimu2
+    use_vship = False
     if ssimu2 == "":
         try:
             result = core.vszip.XPSNR(cut_source_clip, cut_encoded_clip, temporal=False, verbose=False)
@@ -866,11 +919,10 @@ def calculate_metric() -> None:
             console.print(f"[red]vs-zip not found. Check your installation.")
             raise SystemExit(1)
     elif ssimu2 == "gpu":
-        try:
-            result = core.vship.SSIMULACRA2(cut_source_clip, cut_encoded_clip, numStream = 2)
-        except:
+        if not hasattr(core, "vship"):
             console.print(f"[red]Vship not found. Check your installation.")
             raise SystemExit(1)
+        use_vship = True
     elif ssimu2 == "cpu":
         try:
             result = core.vszip.SSIMULACRA2(cut_source_clip, cut_encoded_clip)
@@ -878,10 +930,10 @@ def calculate_metric() -> None:
             console.print(f"[red]vs-zip not found. Check your installation.")
             raise SystemExit(1)
     else:
-        try:
-            result = core.vship.SSIMULACRA2(cut_source_clip, cut_encoded_clip, numStream = 2)
+        if hasattr(core, "vship"):
             ssimu2 = "gpu"
-        except:
+            use_vship = True
+        else:
             console.print(f"[yellow]Vship not found or available, defaulting to vs-zip.")
             try:
                 result = core.vszip.SSIMULACRA2(cut_source_clip, cut_encoded_clip)
@@ -889,11 +941,6 @@ def calculate_metric() -> None:
             except:
                 console.print(f"[red]vs-zip not found either. Check your installation.")
                 raise SystemExit(1)
-
-    if ssimu2 == "":
-        score_list = [[None] * cut_source_clip.num_frames for _ in range(3)]
-    else:
-        score_list = [None] * result.num_frames
 
     def get_xpsnrprops(n: int, f: vs.VideoFrame) -> None:
         for i, plane in enumerate(["Y", "U", "V"]):
@@ -905,30 +952,51 @@ def calculate_metric() -> None:
     def get_ssimu2props(n: int, f: vs.VideoFrame) -> None:
         score_list[n] = float(f.props.get('_SSIMULACRA2')) if ssimu2 == "gpu" else float(f.props.get('SSIMULACRA2'))
 
-    with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            FPSColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
+    def _run_metric_render(clip_node) -> None:
+        with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                "[progress.percentage]{task.percentage:>3.0f}%",
+                FPSColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console
+            ) as progress:
 
-        task = progress.add_task("[green]Calculating XPSNR scores" if ssimu2 == "" else "[green]Calculating SSIMULACRA2 scores", total=cut_source_clip.num_frames*skip)
+            task = progress.add_task("[green]Calculating XPSNR scores" if ssimu2 == "" else "[green]Calculating SSIMULACRA2 scores", total=cut_source_clip.num_frames*skip)
 
-        def progress_func(n: int, num_frames: int) -> None:
-            progress.update(task, advance=skip)
+            def progress_func(n: int, num_frames: int) -> None:
+                progress.update(task, advance=skip)
 
-        clip_async_render(
-            result,
-            outfile=None,
-            progress=progress_func,
-            callback=get_xpsnrprops if ssimu2 == "" else get_ssimu2props
-        )
+            clip_async_render(
+                clip_node,
+                outfile=None,
+                progress=progress_func,
+                callback=get_xpsnrprops if ssimu2 == "" else get_ssimu2props
+            )
 
-        progress.update(task, description="[cyan]Calculated XPSNR scores " if ssimu2 == "" else "[cyan]Calculated SSIMULACRA2 scores ", completed=cut_source_clip.num_frames*skip)
+            progress.update(task, description="[cyan]Calculated XPSNR scores " if ssimu2 == "" else "[cyan]Calculated SSIMULACRA2 scores ", completed=cut_source_clip.num_frames*skip)
+
+    if use_vship:
+        with _gpu_mutex():
+            for num_streams in (2, 1):
+                try:
+                    result = core.vship.SSIMULACRA2(cut_source_clip, cut_encoded_clip, numStream=num_streams)
+                    score_list = [None] * result.num_frames
+                    _run_metric_render(result)
+                    break
+                except Exception as exc:
+                    if num_streams == 2:
+                        console.print(f"[yellow]Vship GPU falhou ({exc}); liberando VRAM do OCR e tentando com numStream=1...[/yellow]")
+                        _unload_ocr_vram()
+                        gc.collect()
+                        continue
+                    console.print(f"[red]Vship GPU falhou definitivamente: {exc}")
+                    raise SystemExit(1)
+    else:
+        score_list = [[None] * cut_source_clip.num_frames for _ in range(3)] if ssimu2 == "" else [None] * result.num_frames
+        _run_metric_render(result)
 
     if 'source_clip' in locals() and 'encoded_clip' in locals():
         del source_clip
@@ -1049,13 +1117,30 @@ def calculate_zones(ranges: list[float], hr: bool, nframe: int) -> None:
 
     match quality:
         case "low":
-            crf = 40 if hr else 35
+            crf = 47 if hr else 32
         case "medium":
-            crf = 35 if hr else 30
+            crf = 32 if hr else 27
         case "high":
-            crf = 30 if hr else 25
+            crf = 27 if hr else 22
         case _:
             crf = quality
+
+    if target_ssimu2 is not None and ssimu2 != "":
+        p15_floor = target_ssimu2_p15 if target_ssimu2_p15 is not None else (target_ssimu2 - 8.0)
+        projected_avg = metric_average + 1.0
+        effective_delta = min(projected_avg - target_ssimu2, metric_percentile_15 - p15_floor)
+        crf_shift = max(-6.0, min(6.0, round((effective_delta * 0.85) * 4) / 4))
+        orig_crf = crf
+        crf = max(8.0, min(55.0, crf + crf_shift))
+        console.print(
+            f"[cyan]Target SSIMU2 {target_ssimu2:.1f} (p15>={p15_floor:.1f}): "
+            f"fast avg={metric_average:.2f} p15={metric_percentile_15:.2f} -> "
+            f"base CRF {orig_crf:g} -> {crf:g} ({crf_shift:+.2f})[/cyan]"
+        )
+    (tmp_dir / "fast_metrics.txt").write_text(
+        f"{metric_average:.6f},{metric_percentile_15:.6f},{metric_min:.6f},{crf:g}\n",
+        encoding="utf-8"
+    )
 
     with open(zones_file, "w") as file:
         for index in range(len(ranges)):

@@ -44,6 +44,8 @@ Even though the above command is sufficient to run the script, one may use addit
 | `--resume` | Resume the process from the last (un)completed stage [*Default: not active*] |
 | `--stage` | Select stage: 1 = fast encode, 2 = calculate metrics, 3 = generate zones, 4 = final encode [*Default: all*] |
 | `--ssimu2` | Select the SSIMULACRA2 metric model: vs-zip (CPU), Vship (GPU) or auto [*Default: XPSNR metric*] |
+| `--target-ssimu2` | Target final average SSIMULACRA2 score; automatically adjusts base CRF from fast-pass metrics |
+| `--target-ssimu2-p15` | Minimum 15th percentile SSIMULACRA2 floor [*Default: target-ssimu2 - 8.0*] |
 | `--fast-speed` | Fast encode speed (Allowed: medium, fast, faster) [*Default: faster*] |
 | `--final-speed` | Final encode speed (Allowed: slower, slow, medium, fast, faster) [*Default: slow*] |
 | `--quality` | Base encoder --quality (Allowed: low, medium, high) [*Default: medium*] |
@@ -53,6 +55,13 @@ Even though the above command is sufficient to run the script, one may use addit
 | `--final-params` | Custom final encoding parameters |
 
 Yes, the script is even capable of resuming unfinished encodes like Av1an, and can also be run with boosting disabled if all you care is the convenience of a SVT-AV1-Essential wrapper.
+
+### Fork Enhancements (`ednancosta`)
+- **Auto-CRF Target Discovery (`--target-ssimu2` / `--target-ssimu2-p15`):** Estimates final SSIMULACRA2 from 100% of the fast-pass (`metric_average` and 15th percentile floor) and shifts the base CRF automatically (clamped `±6.0` in `0.25` steps) before computing per-scene `--zones`, delivering `ab-av1`-style target consistency with zero extra encode passes.
+- **Fast-Pass Metrics Export:** Writes `fast_metrics.txt` (`avg,p15,min,effective_crf`) in the temp directory for calibration logging without extra compute cost.
+- **Visible Encoder Errors:** Captures and prints the last 25 lines of `SvtAv1EncApp` `stderr` on failures instead of silencing output.
+- **Numeric `--crf` Parsing & Propagation:** Uses regex parsing for `--crf` in `--fast-params` and propagates numeric CRF into `final_pass()` when not overridden in `--final-params`.
+- **Zero-Copy `YUV420P10` & `vstools` Compat:** Bypasses redundant bilinear conversion on native 10-bit 4:2:0 sources and uses modern `src.set_output()`.
 
 ### Known-issue
 
