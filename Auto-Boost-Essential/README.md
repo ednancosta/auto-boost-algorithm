@@ -62,6 +62,7 @@ Yes, the script is even capable of resuming unfinished encodes like Av1an, and c
 - **Visible Encoder Errors:** Captures and prints the last 25 lines of `SvtAv1EncApp` `stderr` on failures instead of silencing output.
 - **Numeric `--crf` Parsing & Propagation:** Uses regex parsing for `--crf` in `--fast-params` and propagates numeric CRF into `final_pass()` when not overridden in `--final-params`.
 - **Zero-Copy `YUV420P10` & `vstools` Compat:** Bypasses redundant bilinear conversion on native 10-bit 4:2:0 sources and uses modern `src.set_output()`.
+- **Stage-Boundary `--resume`:** Preserves completed stages (`fast_pass`, metrics, `zones`) while unlinking partial `.ivf` files from interrupted passes so any incomplete `fast_pass` or `final_pass` cleanly restarts from frame 0 without mid-pass IVF splicing/desync.
 
 ### Known-issue
 

@@ -250,6 +250,13 @@ if os.path.exists(tmp_dir):
             else:
                 print(f'Resuming from stage {stage_resume}.')
 
+    # Resume only at stage boundaries: an interrupted pass restarts from frame 0 (mid-pass IVF splicing caused desync/corruption).
+    if resume:
+        if stage_resume < 2 and fast_output_file.exists():
+            fast_output_file.unlink()
+        if stage_resume < 5 and tmp_final_output_file.exists():
+            tmp_final_output_file.unlink()
+
     if not resume and stage in [0, 1]:
         shutil.rmtree(tmp_dir)
 
